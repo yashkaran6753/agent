@@ -1,0 +1,75 @@
+python -m venv .venv
+source .venv/Scripts/activate
+pip install -r requirements.txt
+python main.py
+
+python src/agent.py
+
+playwright install
+playwright install-deps
+__________
+
+work did:
+detector.py is improved, Python Wappalyzer is implemented, wrote the test_detector.py and test results are all good
+
+planner.py is improved, write test_planning_flow.py and test results are good
+
+executors.py is also good
+
+intelligent error classification,recovery strategies etc :
+error_classifier.py, retry_manager.py, agent.py
+researched common web scraping errors and tried to implement those error handlings in our agent
+
+
+feedback from deepseek
+
+
+__________
+
+changed files :
+
+detector
+agent
+state
+planner
+requirements
+
+
+installed packages:
+
+pip install python-wappalyzer
+
+
+
+__________
+
+TO DO:
+
+0.1 
+
+add the things to agent step by step and test them (write test cases for each service)
+
+
+1. 
+
+Import inconsistencies: Some imports reference paths that may not exist (e.g., from utils.api_interceptor import generate_requests_script)
+Synchronous user input: Uses input() which may not work in non-interactive environments
+Error handling: Some exception handling could be more robust
+API-first mode: Partially implemented but may need refinement
+Robots.txt check: Very basic implementation
+Browser-use integration: Present but may need testing for complex sites
+
+
+2. 
+
+over all bugs
+
+
+3. 
+
+ideas in my mind
+
+4. unit testing, stress stesting, performance testing, SAST etc etc etc 
+
+
+5. split the big codes into services

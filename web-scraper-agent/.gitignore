@@ -1,0 +1,11 @@
+.env
+logs/
+scripts/
+version1.txt
+notes.txt
+main.py
+headlessbrowserdevtools.py
+crew.py
+analyze_page.py
+sessions/
+data/
