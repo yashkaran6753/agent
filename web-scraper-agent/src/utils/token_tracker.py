@@ -14,8 +14,9 @@ class TokenTracker:
         import time
         elapsed = time.time() - start_time
         cost = (self.total / 1_000_000) * 0.15
-        print("="*50)
-        print(f"⏱️  Time taken: {elapsed:.1f}s ({elapsed/60:.1f}min)")
-        print(f"🪙  Tokens used: {self.total:,}")
-        print(f"💰  Est. cost: ${cost:.4f}")
-        print("="*50)
+        from loguru import logger
+        logger.info("{}", "="*50)
+        logger.info("⏱️  Time taken: {0:.1f}s ({0/60:.1f}min)", elapsed)
+        logger.info("🪙  Tokens used: {0:,}", self.total)
+        logger.info("💰  Est. cost: ${0:.4f}", cost)
+        logger.info("{}", "="*50)

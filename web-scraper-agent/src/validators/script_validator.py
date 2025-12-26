@@ -26,8 +26,9 @@ class ScriptValidator:
             if proc.returncode != 0:
                 return False, f"Runtime error: {output}"
             
-            # Check data file exists
+            # Check data file exists (check both workspace data and scripts/data)
             data_files = list(Path("data").glob("*.json")) + list(Path("data").glob("*.csv"))
+            data_files += list((Path("scripts") / "data").glob("*.json")) + list((Path("scripts") / "data").glob("*.csv"))
             if not data_files:
                 return False, "No data files created"
             
@@ -70,6 +71,7 @@ class ScriptValidator:
                 return False, f"Runtime error: {stderr.decode()}"
             
             data_files = list(Path("data").glob("*.json")) + list(Path("data").glob("*.csv"))
+            data_files += list((Path("scripts") / "data").glob("*.json")) + list((Path("scripts") / "data").glob("*.csv"))
             if not data_files:
                 return False, "No data files created"
             

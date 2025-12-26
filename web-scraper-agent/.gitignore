@@ -9,3 +9,4 @@ crew.py
 analyze_page.py
 sessions/
 data/
+_pycache_/

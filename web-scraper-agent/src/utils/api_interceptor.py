@@ -25,9 +25,11 @@ class APIInterceptor:
 
     @staticmethod
     def generate_requests_script(endpoint: str, params: dict = None) -> str:
+        # Save generated API script to write into scripts/data to follow agent conventions
         return f'''
 import requests
 import json
+from pathlib import Path
 
 url = "{endpoint}"
 params = {json.dumps(params or {})}
@@ -36,9 +38,11 @@ headers = {{"User-Agent": "Mozilla/5.0"}}
 response = requests.get(url, params=params, headers=headers)
 data = response.json()
 
-# Save data
-with open("data/api_data.json", "w") as f:
+# Save data under scripts/data
+out_dir = Path("scripts") / "data"
+out_dir.mkdir(parents=True, exist_ok=True)
+with open(out_dir / "api_data.json", "w") as f:
     json.dump(data, f, indent=2)
 
-print(f"Saved {{len(data)}} items from API")
+print(f"Saved {{len(data)}} items from API to {{out_dir}}")
 '''

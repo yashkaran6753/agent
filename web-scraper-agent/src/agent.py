@@ -43,8 +43,9 @@ class WebAutomationAgent:
         self.validator = ScriptValidator()
         self.retry_manager = RetryManager()
         self.recovery_manager = RecoveryManager()
-        self.sessions = Path("sessions"); self.sessions.mkdir(exist_ok=True)
-        self.scripts = Path("scripts"); self.scripts.mkdir(exist_ok=True)
+        # Do not pre-create 'sessions' or 'scripts' here; keep root folders managed at project level
+        self.sessions = Path("sessions")
+        self.scripts = Path("scripts")
         self.crawl_delay = 0  # Default crawl delay from robots.txt
         self.rate_limiter = RateLimiter()
         # self.privacy_filter = PrivacyFilter()
@@ -56,8 +57,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 import pandas as pd
 
-DATA = Path("data"); DATA.mkdir(exist_ok=True)
-SESSIONS = Path("sessions"); SESSIONS.mkdir(exist_ok=True)  # Added: Ensure sessions dir exists
+DATA = Path(__file__).parent / "data"; DATA.mkdir(parents=True, exist_ok=True)
 async def save(kind, payload, name):
     out = (DATA / name).with_suffix(f".{kind}")
     if kind == "json":
@@ -101,14 +101,81 @@ if __name__ == "__main__":
 ''')
 
     # ---------- CLARIFIER ---------- #
-    async def _clarify(self, html: str) -> str:
+    async def _capture_visual_context(self, page, max_visible=8) -> str:
+        """Capture a compact visual summary from the page (DOM-derived, token-efficient).
+
+        Returns a short text summary suitable for including in LLM prompts.
+        Does not send image bytes to the model to avoid token spikes.
+        """
+        try:
+            info = await page.evaluate(
+                """() => {
+                    const getText = el => (el && el.innerText) ? el.innerText.trim().replace(/\s+/g,' ') : '';
+                    const title = document.title || '';
+                    const headings = Array.from(document.querySelectorAll('h1,h2,h3')).map(getText).slice(0,5);
+                    const paragraphs = Array.from(document.querySelectorAll('p')).map(getText).slice(0,10);
+                    const cta = Array.from(document.querySelectorAll('button, a')).map(getText).filter(t => t).slice(0,10);
+                    const imgs = Array.from(document.querySelectorAll('img')).slice(0,10).map(i => i.alt || '');
+                    return {title, headings, paragraphs, cta, imgs, url: location.href};
+                }"""
+            )
+
+            parts = []
+            if info.get('title'):
+                parts.append(f"TITLE: {info['title']}")
+            if info.get('headings'):
+                parts.append("HEADINGS: " + "; ".join([h for h in info['headings'] if h]))
+            if info.get('paragraphs'):
+                # keep only a few short paragraphs
+                parts.append("PARAGRAPHS: " + " | ".join([p[:120] for p in info['paragraphs'] if p][:max_visible]))
+            if info.get('cta'):
+                parts.append("CTAS: " + ", ".join(info['cta']))
+            if info.get('imgs'):
+                img_alts = [a for a in info['imgs'] if a]
+                if img_alts:
+                    parts.append("IMAGE_ALTS: " + ", ".join(img_alts[:6]))
+
+            summary = "\n".join(parts)
+
+            # Save a small screenshot for inspection (optional); keep under scripts/tmp_screenshots
+            try:
+                tmp_dir = Path(self.scripts) / 'tmp_screenshots'
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                stamp = int(time.time())
+                path = tmp_dir / f"visual_{stamp}.png"
+                await page.screenshot(path=str(path), full_page=False)
+                logger.debug("Saved visual screenshot to {}", path)
+            except Exception as _:
+                pass
+
+            # Truncate summary to keep token usage low
+            return summary[:1200]
+        except Exception as e:
+            logger.debug("Failed to capture visual context: {}", e)
+            return ""
+
+    async def _clarify(self, html: str, page: Page | None = None) -> str:
         prompt = CLARIFIER.format(task=self.state.task, html=html[:1000])
         reply = await ask_llm("You are helpful.", prompt, temp=0.1)
+
         if reply.lower() not in ["ok", "yes", "clear"]:
-            print(f"❓ {reply}")
-            answer = input("Your answer: ").strip()
-            self.state.task += f" | Clarification: {answer}"
-            return answer
+            # If a page is available, capture a compact visual summary and re-ask the LLM
+            visual = ""
+            if page is not None:
+                visual = await self._capture_visual_context(page)
+
+            if visual:
+                augmented = prompt + "\n\nVISUAL_SUMMARY:\n" + visual
+                reply2 = await ask_llm("You are helpful.", augmented, temp=0.1)
+                reply = reply2 or reply
+
+            # If still ambiguous, ask the human operator
+            if reply.lower() not in ["ok", "yes", "clear"]:
+                logger.info("LLM clarification: {}", reply)
+                answer = input("Your answer: ").strip()
+                self.state.task += f" | Clarification: {answer}"
+                return answer
+
         return ""
 
     # ---------- PLANNER (ENHANCED) ---------- #
@@ -129,7 +196,7 @@ if __name__ == "__main__":
             url=self.state.url
         )
         raw = await ask_llm("You are a planner. Return JSON array only.", prompt)
-        print(f"Raw LLM output for plan: {raw}")
+        logger.debug("Raw LLM output for plan: {}", raw)
         raw = raw.strip().removeprefix('```json').removesuffix('```').strip()
         try:
             parsed = json.loads(raw)
@@ -158,7 +225,7 @@ if __name__ == "__main__":
             self.state.attempt_history.append({"plan": steps, "framework": framework})
             return steps
         except Exception as e:
-            print(f"Bad JSON from LLM – fallback: {e}")
+            logger.warning("Bad JSON from LLM – fallback: {}", e)
             default_steps = [
                 {"comment": "Navigate", "element": "", "action": "goto", "critical": True},
                 {"comment": "Extract content", "action": "extract", "selector": "article", "fields": {"title": "h1", "body": "p, h2"}, "save_as": "content", "critical": True}
@@ -166,7 +233,7 @@ if __name__ == "__main__":
             return default_steps
 
     # ---------- REPLAN WITH FEEDBACK ---------- #
-    async def _replan_with_feedback(self, html: str, feedback: str) -> list:
+    async def _replan_with_feedback(self, html: str, feedback: str, visuals: dict | None = None) -> list:
         history = json.dumps(self.state.attempt_history[-2:], indent=2)
         prompt = f"""
 Previous attempts:
@@ -180,8 +247,23 @@ HTML snapshot: {html[:1200]}
 Generate a CORRECTED plan that addresses the feedback.
 Return a JSON array of steps only, no outer object.
 """
+        # If visual summaries are provided, append a compact visual context
+        if visuals:
+            try:
+                vis_parts = []
+                for key, v in visuals.items():
+                    if not v:
+                        continue
+                    # keep small
+                    snippet = (v.get('visual_summary') or '')[:600]
+                    path = v.get('screenshot_path', '')
+                    vis_parts.append(f"- {key}: {snippet}{(' [screenshot:' + path + ']') if path else ''}")
+                if vis_parts:
+                    prompt += "\n\nVISUAL_SUMMARIES:\n" + "\n".join(vis_parts)
+            except Exception:
+                logger.debug("Failed to append visual summaries to replan prompt")
         raw = await ask_llm("You learn from mistakes. Return JSON only. No markdown or code blocks.", prompt)
-        print(f"Raw LLM output for replan: {raw}")
+        logger.debug("Raw LLM output for replan: {}", raw)
         raw = raw.strip().removeprefix('```json').removesuffix('```').strip()
         try:
             parsed = json.loads(raw)
@@ -192,7 +274,7 @@ Return a JSON array of steps only, no outer object.
             self.state.attempt_history.append({"feedback": feedback, "new_plan": steps})
             return steps
         except:
-            print("Replan failed – using fallback")
+            logger.warning("Replan failed – using fallback")
             return [{"comment": "Extract", "action": "extract", "save_as": "fallback", "critical": True}]
 
     # ---------- COMPRESS HTML ---------- #
@@ -429,9 +511,9 @@ Return a JSON array of steps only, no outer object.
             import json
             from pathlib import Path
             
-            # Create data directory if it doesn't exist
-            data_dir = Path("data")
-            data_dir.mkdir(exist_ok=True)
+            # Store data chunks under the agent's `scripts` folder to avoid a root-level `data/`
+            data_dir = Path(self.scripts) / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
             
             # Save as JSON with timestamp to avoid overwrites
             timestamp = int(time.time() * 1000)  # millisecond precision
@@ -453,7 +535,8 @@ Return a JSON array of steps only, no outer object.
             import aiofiles
             from pathlib import Path
             
-            data_dir = Path("data")
+            # Load from the agent's `scripts/data` directory; avoid root-level `data/`
+            data_dir = Path(self.scripts) / "data"
             if not data_dir.exists():
                 return []
             
@@ -473,7 +556,7 @@ Return a JSON array of steps only, no outer object.
                 except Exception as e:
                     logger.warning(f"Failed to load chunk {chunk_file}: {e}")
             
-            logger.info(f"📂 Loaded {len(all_data)} items from {len(list(data_dir.glob(chunk_pattern)))} chunks")
+            logger.info("📂 Loaded {} items from {} chunks", len(all_data), len(list(data_dir.glob(chunk_pattern))))
             return all_data
             
         except Exception as e:
@@ -629,16 +712,20 @@ Return a JSON array of steps only, no outer object.
 
     # ---------- MAIN RUN ---------- #
     async def run(self, max_attempts: int = 5):
+        logger.info("Agent starting run: max_attempts={}", max_attempts)
         self.state = AgentState(url=os.getenv("TARGET_URL"), task=os.getenv("TASK_DESCRIPTION"))
+        session_file = ""  # path to temporary session file used when generating scripts
+        logger.debug("Loaded AgentState: url={} task_len={}", self.state.url, len(self.state.task) if self.state.task else 0)
         if not self.state.url or not self.state.task:
             raise ValueError("TARGET_URL and TASK_DESCRIPTION must be in .env")
 
-        print(f"🚀 Task: {self.state.task}")
-        print(f"📍 URL: {self.state.url}")
-        print(f"🔁 Max attempts: {max_attempts}")
+        logger.info("🚀 Task: {}", self.state.task)
+        logger.info("📍 URL: {}", self.state.url)
+        logger.info("🔁 Max attempts: {}", max_attempts)
 
         for attempt in range(max_attempts):
-            print(f"\n{'='*60}\n Attempt #{attempt + 1}\n{'='*60}")
+            logger.info("\n{}\n Attempt #{}\n{}", '='*60, attempt + 1, '='*60)
+            logger.info("Starting attempt {}/{}", attempt + 1, max_attempts)
 
             browser = await self.pool.get()
             context = await browser.new_context(
@@ -650,21 +737,20 @@ Return a JSON array of steps only, no outer object.
             if session_data:
                 # Create a temporary file for Playwright to load
                 import tempfile
-                import json
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
                     json.dump(session_data, temp_file)
                     temp_file_path = temp_file.name
+                    session_file = temp_file_path
                 
-                try:
-                    await context.storage_state(path=temp_file_path)
-                    logger.info(f"🔐 Loaded secure session for {domain}")
-                finally:
-                    # Clean up temp file
-                    import os
                     try:
-                        os.unlink(temp_file_path)
-                    except:
-                        pass
+                        await context.storage_state(path=temp_file_path)
+                        logger.info("Loaded secure session for {} (tempfile={})", domain, temp_file_path)
+                    finally:
+                        # Clean up temp file
+                        try:
+                            os.unlink(temp_file_path)
+                        except Exception as e:
+                            logger.debug("Failed to unlink temp session file {}: {}", temp_file_path, e)
             page = await context.new_page()
 
             # 1. Navigate & check robots.txt
@@ -674,14 +760,19 @@ Return a JSON array of steps only, no outer object.
             await page.goto(self.state.url, wait_until="domcontentloaded")
             # Wait for content to load
             await page.wait_for_timeout(2000)  # Give time for dynamic content
+            logger.debug("Page navigated to {}, waiting complete", self.state.url)
             if not await self.check_robots(self.state.url, page):
                 await self.pool.release(browser)
                 return  # Abort if disallowed
 
             html = await self._compress_html(page)
             try:
+                logger.debug("Starting framework detection")
                 self.state.framework = await self.detector.detect(page, len(html))
+                logger.info("Framework detected: {}", self.state.framework)
+                logger.debug("Analyzing tech stack")
                 self.state.tech_info = await self.detector._analyze_tech_stack(page)  # Store detailed tech info
+                logger.debug("Tech info: {}", json.dumps(self.state.tech_info)[:1000])
             except Exception as e:
                 logger.warning(f"Framework detection failed, using default playwright: {e}")
                 self.state.framework = "playwright"
@@ -722,18 +813,20 @@ Return a JSON array of steps only, no outer object.
             # 2. Try API-First mode if Playwright detected
             if self.state.framework == "playwright":
                 apis = await APIInterceptor.intercept_api_calls(page)
+                logger.debug("APIInterceptor returned {} endpoints", len(apis) if apis else 0)
                 if apis and len(apis) > 0:
-                    print(f"🔌 Detected API endpoints: {list(apis.keys())}")
+                    logger.info("🔌 Detected API endpoints: {}", list(apis.keys()))
                     self.state.api_endpoints = list(apis.keys())  # Store for recovery use
                     endpoint = list(apis.keys())[0]
                     
                     # Enhanced API validation with actual data parsing
                     api_validation_result = await self._validate_api_endpoint(endpoint, apis[endpoint])
+                    logger.debug("API validation result: {}", api_validation_result)
                     
                     if api_validation_result["is_valid"]:
-                        print(f"✅ API validation successful: {api_validation_result['summary']}")
+                        logger.info("✅ API validation successful: {}", api_validation_result['summary'])
                         if api_validation_result["recommend_api_mode"]:
-                            print("✅ Auto-enabling API-first mode (high-quality API data detected)")
+                            logger.info("✅ Auto-enabling API-first mode (high-quality API data detected)")
                             self.state.framework = "api-first"
                             script_dir = self.scripts / f"{int(time.time())}_{domain}_{attempt}_api"
                             script_dir.mkdir(parents=True, exist_ok=True)
@@ -742,12 +835,12 @@ Return a JSON array of steps only, no outer object.
                             from utils.api_interceptor import generate_requests_script
                             script = generate_requests_script(endpoint, validation_info=api_validation_result)
                             (script_dir / "main.py").write_text(script)
-                            print("✅ API-first script generated with enhanced validation")
+                            logger.info("✅ API-first script generated with enhanced validation")
                             await self.pool.release(browser)
                             break
                     
                     # Fallback to manual decision if auto-detection inconclusive
-                    print(f"🤔 API detected but validation inconclusive: {api_validation_result['summary']}")
+                    logger.info("🤔 API detected but validation inconclusive: {}", api_validation_result['summary'])
                     use_api = input("Use API-first mode? (yes/no): ").strip().lower()
                     if use_api in ["yes", "y"]:
                         self.state.framework = "api-first"
@@ -756,9 +849,12 @@ Return a JSON array of steps only, no outer object.
                         break
 
             # 3. Clarify & Plan
-            await self._clarify(html)
+            logger.info("Requesting clarification (if needed)")
+            await self._clarify(html, page)
+            logger.info("Requesting plan from LLM")
             steps = await self._plan(html, self.state.framework)
-            print("📋 Plan:", json.dumps(steps, indent=2))
+            logger.debug("Plan received with {} steps", len(steps))
+            logger.info("📋 Plan: {}", json.dumps(steps, indent=2))
 
             # 4. Execute (framework-aware)
             extracted_data = {}
@@ -776,8 +872,9 @@ Return a JSON array of steps only, no outer object.
                     
                     for idx, step in enumerate(steps, 1):
                         step_name = f"Step {idx}: {step['comment']}"
-                        print(f"Executing {step_name}")
-                        print(f"Step details: {json.dumps(step, indent=2)}")
+                        logger.info("Executing {}", step_name)
+                        logger.debug("Step details: {}", json.dumps(step, indent=2))
+                        logger.info("Executing {} (action={} selector={})", step_name, step.get('action'), step.get('selector'))
 
                         # Enhanced error handling with recovery
                         recovery_attempted = False
@@ -795,11 +892,12 @@ Return a JSON array of steps only, no outer object.
                                 if step.get("data_saved_to_disk", False):
                                     # Data was saved to disk, load it later
                                     extracted_data[step["save_as"]] = f"STREAMED_TO_DISK"
-                                    print(f"Data streamed to disk for {step['save_as']}")
+                                    logger.info("Data streamed to disk for {}", step['save_as'])
                                 else:
                                     # Data kept in memory
                                     extracted_data[step["save_as"]] = step.get("extracted_data", [])
-                                    print(f"Extracted data sample: {json.dumps(extracted_data[step['save_as']][:2], indent=2)}")
+                                    logger.debug("Extracted sample for {}: {}", step["save_as"], json.dumps(extracted_data[step['save_as']][:2]))
+                                    logger.debug("Extracted data sample: {}", json.dumps(extracted_data[step['save_as']][:2], indent=2))
                             elif step["action"] == "download":
                                 urls = await page.evaluate(
                                     f"""() => Array.from(document.querySelectorAll('{step.get("selector", "img")}'))
@@ -836,12 +934,12 @@ Return a JSON array of steps only, no outer object.
                                     )
 
                                     # Recovery successful
-                                    if recovery_step["action"] == "extract":
-                                        if recovery_step.get("data_saved_to_disk", False):
-                                            extracted_data[recovery_step["save_as"]] = f"STREAMED_TO_DISK"
-                                        else:
-                                            extracted_data[recovery_step["save_as"]] = recovery_step.get("extracted_data", [])
-                                        print(f"✅ Recovery successful - extracted data sample: {json.dumps(extracted_data[recovery_step['save_as']][:2], indent=2)}")
+                                        if recovery_step["action"] == "extract":
+                                            if recovery_step.get("data_saved_to_disk", False):
+                                                extracted_data[recovery_step["save_as"]] = f"STREAMED_TO_DISK"
+                                            else:
+                                                extracted_data[recovery_step["save_as"]] = recovery_step.get("extracted_data", [])
+                                            logger.info("✅ Recovery successful - extracted data sample: {}", json.dumps(extracted_data[recovery_step['save_as']][:2], indent=2))
 
                                     recovery_attempted = True
                                     logger.success(f"🔧 Recovery successful for {step_name}")
@@ -887,6 +985,7 @@ Return a JSON array of steps only, no outer object.
 
             # 5. Generate script (framework-aware)
             script_dir = self.scripts / f"{int(time.time())}_{domain}_{attempt}"
+            logger.info("Generating script in {} for framework={}", script_dir, self.state.framework)
             script_dir.mkdir(parents=True, exist_ok=True) 
             if self.state.framework == "scrapy":
                 extract_step = next((s for s in steps if s.get("action") == "extract"), {})
@@ -913,15 +1012,27 @@ Return a JSON array of steps only, no outer object.
                 script_path = script_dir / "main.py"
                 script_path.write_text(script)
                 (script_dir / "data_sample.json").write_text(json.dumps(extracted_data, indent=2))
-            print(f"📁 Script saved → {script_path}")
-            print(f"📁 Data saved → {script_dir / 'data_sample.json'}")
+            logger.info("Script written to {}", script_path)
+            logger.debug("Data sample written to {}", script_dir / 'data_sample.json')
+            logger.info("📁 Script saved → {}", script_path)
+            logger.info("📁 Data saved → {}", script_dir / 'data_sample.json')
 
             # 6. Validate & Test
+            logger.info("Validating generated script: {}", script_path)
             valid, error = self.validator.check_syntax(script_path)
             if not valid:
-                print(f"⚠️  Syntax error: {error}")
+                logger.warning("⚠️  Syntax error: {}", error)
+                logger.warning("Script syntax invalid: {}", error)
                 if attempt < max_attempts - 1:
-                    steps = await self._replan_with_feedback(html, f"Syntax error: {error}")
+                    # Gather any visual summaries from steps to provide compact visual context
+                    visuals = {}
+                    try:
+                        for i, s in enumerate(steps):
+                            if isinstance(s, dict) and (s.get('visual_summary') or s.get('screenshot_path')):
+                                visuals[f"step_{i}"] = {'visual_summary': s.get('visual_summary', ''), 'screenshot_path': s.get('screenshot_path', '')}
+                    except Exception:
+                        visuals = None
+                    steps = await self._replan_with_feedback(html, f"Syntax error: {error}", visuals=visuals)
                     await self.pool.release(browser)
                     continue
 
@@ -949,22 +1060,31 @@ Return a JSON array of steps only, no outer object.
             if any("csv" in s.get("save_as", "") for s in steps):
                 from content_saver import save
                 csv_path = await save("csv", extracted_data.get("data", []), "exported")
-                print(f"📁 CSV exported → {csv_path}")
+                logger.info("📁 CSV exported → {}", csv_path)
 
             # 8. Human approval
             approved, feedback = await self._ask_approval(extracted_data, script_path)
+            logger.info("User approval result: {}", approved)
             if approved:
                 await self.pool.release(browser)
-                print("✅ Task completed successfully!")
+                logger.info("✅ Task completed successfully!")
                 break
             else:
-                print(f"❌ Feedback: {feedback}")
+                logger.info("❌ Feedback: {}", feedback)
+                logger.info("User feedback: {}", feedback)
                 if attempt < max_attempts - 1:
-                    steps = await self._replan_with_feedback(html, feedback)
+                    visuals = {}
+                    try:
+                        for i, s in enumerate(steps):
+                            if isinstance(s, dict) and (s.get('visual_summary') or s.get('screenshot_path')):
+                                visuals[f"step_{i}"] = {'visual_summary': s.get('visual_summary', ''), 'screenshot_path': s.get('screenshot_path', '')}
+                    except Exception:
+                        visuals = None
+                    steps = await self._replan_with_feedback(html, feedback, visuals=visuals)
                     await self.pool.release(browser)
-                    print("🔄 Re-planning...")
+                    logger.info("🔄 Re-planning...")
                 else:
-                    print("Max attempts reached. Saving final version.")
+                    logger.info("Max attempts reached. Saving final version.")
 
         tk.print_summary(self.state.start)
         await self.pool.close()

@@ -1,7 +1,8 @@
 # src/frameworks/executors.py (100% GENERIC: No hard-coded text, selectors, or fields)
 from playwright.async_api import Page
-import asyncio, json
+import asyncio, json, time
 from loguru import logger
+from pathlib import Path
 from ..content_saver import save
 from ..utils.paginator import Paginator
 from browser_use import Agent, Browser, Controller
@@ -21,13 +22,16 @@ class PlaywrightExecutor:
                 let hasContent = false;
                 
                 for (const [fieldName, fieldSelector] of Object.entries(fields)) {
-                    const element = container.querySelector(fieldSelector);
-                    if (element) {
-                        const text = element.textContent ? element.textContent.trim() : '';
-                        if (text) {
-                            record[fieldName] = text;
-                            hasContent = true;
-                        }
+                    let text = '';
+                    if (fieldSelector === '.') {
+                        text = container.textContent ? container.textContent.trim() : '';
+                    } else {
+                        const element = container.querySelector(fieldSelector);
+                        if (element) text = element.textContent ? element.textContent.trim() : '';
+                    }
+                    if (text) {
+                        record[fieldName] = text;
+                        hasContent = true;
                     }
                 }
                 
@@ -49,9 +53,11 @@ class PlaywrightExecutor:
                 const record = {};
                 
                 for (const [fieldName, fieldSelector] of Object.entries(fields)) {
-                    const element = container.querySelector(fieldSelector);
-                    if (element) {
-                        record[fieldName] = element.textContent ? element.textContent.trim() : '';
+                    if (fieldSelector === '.') {
+                        record[fieldName] = container.textContent ? container.textContent.trim() : '';
+                    } else {
+                        const element = container.querySelector(fieldSelector);
+                        record[fieldName] = element ? (element.textContent ? element.textContent.trim() : '') : '';
                     }
                 }
                 
@@ -71,9 +77,11 @@ class PlaywrightExecutor:
                 const record = {};
                 
                 for (const [fieldName, fieldSelector] of Object.entries(fields)) {
-                    const element = container.querySelector(fieldSelector);
-                    if (element) {
-                        record[fieldName] = element.textContent ? element.textContent.trim() : '';
+                    if (fieldSelector === '.') {
+                        record[fieldName] = container.textContent ? container.textContent.trim() : '';
+                    } else {
+                        const element = container.querySelector(fieldSelector);
+                        record[fieldName] = element ? (element.textContent ? element.textContent.trim() : '') : '';
                     }
                 }
                 
@@ -172,21 +180,46 @@ class PlaywrightExecutor:
             
             // Execute extraction and return result
             return {function_name}('{container_sel}', {fields_json});
-        }}"""
-        
-        return js_code
+                try:
+                    fallback_data = await page.evaluate(f"""
+                    () => {{
+                        const containers = document.querySelectorAll('{container_sel}');
+                        return Array.from(containers).map(container => ({
+                            'fallback_text': container.textContent ? container.textContent.trim() : '',
+                            'error': 'JS extraction failed'
+                        }));
+                    }}
+                    """)
+                    step["extracted_data"] = fallback_data or []
 
-    @staticmethod
-    def _adapt_extraction_based_on_tech(container_sel: str, fields: dict, tech_info: dict) -> str:
-        """
-        Simplified tech-aware extraction - now delegates to the new method.
-        Kept for backward compatibility.
-        """
-        return PlaywrightExecutor._generate_simple_extraction_js(container_sel, fields, tech_info)
+                    # Try to capture a focused element screenshot and short text summary
+                    try:
+                        tmp_dir = Path("scripts") / "tmp_screenshots"
+                        tmp_dir.mkdir(parents=True, exist_ok=True)
+                        stamp = int(time.time())
+                        # Capture first matching element if present
+                        el = await page.query_selector(container_sel)
+                        if el:
+                            shot_path = tmp_dir / f"element_{stamp}.png"
+                            await el.screenshot(path=str(shot_path))
+                            # Capture a short text summary from the element
+                            try:
+                                text = (await page.evaluate("el => el.innerText", el)) or ''
+                            except Exception:
+                                text = ''
+                            step["visual_summary"] = (text.strip().replace('\n', ' ')[:500])
+                            step["screenshot_path"] = str(shot_path)
+                            logger.debug("Saved element screenshot {} and summary (len={})", shot_path, len(step["visual_summary"]))
+                        else:
+                            logger.debug("No element found for selector {} to screenshot", container_sel)
+                    except Exception as _:
+                        logger.debug("Element screenshot failed for selector {}", container_sel)
 
-    @staticmethod
-    async def execute_step(page: Page, step: dict, tech_info: dict = None) -> None:
-        action = step["action"]
+                    logger.warning("⚠️ Used fallback extraction, got {} items", len(step['extracted_data']))
+                except Exception as fallback_error:
+                    logger.error("Even fallback extraction failed: {}", fallback_error)
+                    step["extracted_data"] = []
+        logger.debug("Executor: starting action={} save_as={} selector={}", action, step.get("save_as"), step.get("selector"))
         
         if action == "click":
             sel = step.get("selector") or f"text={step['element']}"
@@ -199,7 +232,11 @@ class PlaywrightExecutor:
             
         elif action == "extract":
             # Simplified tech-aware extraction with validation
-            fields = step.get("fields", {"text": "span"})
+            # If the plan didn't provide fields, assume container holds the text directly
+            if step.get("fields"):
+                fields = step.get("fields")
+            else:
+                fields = {"text": "."}
             container_sel = step.get("selector", "div")
             
             # Add delay for SPAs
@@ -228,7 +265,7 @@ class PlaywrightExecutor:
                 # Execute the validated JS
                 data = await page.evaluate(js_code)
                 step["extracted_data"] = data or []
-                logger.info(f"📊 Extracted {len(step['extracted_data'])} items using validated JS")
+                logger.info("Executor: extracted {} items for save_as={}", len(step.get('extracted_data', [])), step.get('save_as'))
                 
             except Exception as js_error:
                 logger.error(f"JS execution failed: {js_error}")
@@ -297,7 +334,8 @@ class PlaywrightExecutor:
     @staticmethod
     def generate_code(step: dict) -> str:
         if step["action"] == "extract":
-            fields = step.get("fields", {"text": "span"})
+            # When generating standalone scripts, default to extracting container text
+            fields = step.get("fields", {"text": "."})
             container_sel = step.get("selector", "div")
             filter_dict = step.get("filter", {})
             
@@ -385,9 +423,10 @@ class AutoSpider(scrapy.Spider):
             
             data.append(record)
         
-        Path("data").mkdir(exist_ok=True)
-        Path("data/scrapy_data.json").write_text(json.dumps(data, indent=2))
-        self.log(f"Scrapy: saved {{len(data)}} items")
+        data_path = Path(__file__).parent / "data"
+        data_path.mkdir(parents=True, exist_ok=True)
+        (data_path / "scrapy_data.json").write_text(json.dumps(data, indent=2))
+        self.log(f"Scrapy: saved {len(data)} items")
 
 # Run: scrapy runspider auto_spider.py
 '''
@@ -397,7 +436,50 @@ class BrowserUseExecutor:
     def generate_task(url: str, task: str) -> str:
         return f'Go to {url} and {task}. Use vision if elements are not clear.'
 
-class BrowserUseExecutor:
+    @staticmethod
+    def generate_code(url: str, task: str, steps: list) -> str:
+        return f"""# Browser-use generated script
+import asyncio
+from playwright.async_api import async_playwright
+
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto('{url}', wait_until='domcontentloaded')
+        # Steps: {steps}
+        await browser.close()
+
+if __name__ == '__main__':
+    asyncio.run(main())
+"""
+
+    @staticmethod
+    async def execute_steps(url: str, task: str, steps: list) -> dict:
+        """Execute a list of steps using Playwright; returns extracted data dict."""
+        from playwright.async_api import async_playwright
+
+        result = {}
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto(url, wait_until='domcontentloaded')
+
+            for step in steps:
+                try:
+                    await PlaywrightExecutor.execute_step(page, step, {})
+                except Exception:
+                    # Continue on step failures in browser-use mode
+                    continue
+
+            for s in steps:
+                if s.get('action') == 'extract':
+                    result[s.get('save_as', f"extract_{len(result)}")] = s.get('extracted_data', [])
+
+            await browser.close()
+        return result
     @staticmethod
     async def execute_steps(url: str, task: str, steps: list) -> dict:
         """

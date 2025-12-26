@@ -3,8 +3,8 @@ from pathlib import Path
 from loguru import logger
 import aiohttp
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path("scripts") / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 async def save(kind: str, payload: list | dict, name: str) -> Path:
     file_stem = DATA_DIR / name
@@ -13,7 +13,8 @@ async def save(kind: str, payload: list | dict, name: str) -> Path:
     if kind == "csv" or (isinstance(payload, list) and payload and isinstance(payload[0], dict)):
         out = file_stem.with_suffix(".csv")
         df = pd.DataFrame(payload)
-        df.to_csv(out, index=False)
+        # Use thread to avoid blocking the event loop on pandas IO
+        await asyncio.to_thread(df.to_csv, out, index=False)
         
     # JSON for nested data
     elif kind == "json":
